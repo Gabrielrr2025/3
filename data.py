@@ -10,6 +10,11 @@ def _empty_fgi_df():
         pd.DatetimeIndex([], name="date")
     )
 
+def _empty_btc_df():
+    return pd.DataFrame({"Open": pd.Series(dtype="float"), "Close": pd.Series(dtype="float")}).set_index(
+        pd.DatetimeIndex([], name="date")
+    )
+
 def get_fgi_history(csv_path: str = "fear_greed.csv") -> pd.DataFrame:
     """
     Carrega o Fear & Greed Index com fallback em 3 níveis:
@@ -32,7 +37,7 @@ def get_fgi_history(csv_path: str = "fear_greed.csv") -> pd.DataFrame:
     
     # PRIORIDADE 2: GitHub raw URL
     try:
-        csv_url = "https://raw.githubusercontent.com/Gabrielrr2025/csv/refs/heads/main/fear_greed.csv"
+        csv_url = "https://raw.githubusercontent.com/Gabrielrr2025/csvexportFGI/refs/heads/main/fear_greed.csv"
         fgi = pd.read_csv(csv_url, parse_dates=["date"], index_col="date")
         fgi["FGI"] = fgi["FGI"].astype(float)
         print(f"✅ FGI carregado do GitHub ({len(fgi)} dias)")
@@ -40,7 +45,7 @@ def get_fgi_history(csv_path: str = "fear_greed.csv") -> pd.DataFrame:
         # Salva localmente para uso futuro
         try:
             fgi.to_csv(csv_path)
-            print(f"💾 CSV salvo localmente em {csv_path}")
+            print(f"💾 CSV FGI salvo localmente")
         except:
             pass
             
@@ -76,12 +81,10 @@ def _fetch_fgi_from_api() -> pd.DataFrame:
                 continue
             
             try:
-                # Tenta timestamp Unix primeiro
                 try:
                     ts_int = int(ts)
                     day = pd.to_datetime(ts_int, unit='s').date()
                 except (ValueError, TypeError):
-                    # Fallback para string MM-DD-YYYY
                     day = pd.to_datetime(str(ts), format="%m-%d-%Y").date()
                 
                 rows.append({"date": pd.to_datetime(day), "FGI": float(val)})
@@ -105,19 +108,21 @@ def _fetch_fgi_from_api() -> pd.DataFrame:
         print(f"❌ Erro ao buscar API: {e}")
         return _empty_fgi_df()
 
-def get_btc_history(start: date, end: date, max_retries: int = 3) -> pd.DataFrame:
+def get_btc_history(start: date, end: date, csv_path: str = "btc_prices.csv") -> pd.DataFrame:
     """
-    Preço diário do BTC-USD com múltiplos fallbacks e retry logic.
+    Preço diário do BTC-USD com múltiplos fallbacks.
     
-    Tentativas em ordem:
-    1. Yahoo Finance (yfinance) - retry até 3x com delay
-    2. CoinGecko API
-    3. Binance API (sem autenticação necessária)
+    Prioridade:
+    1. CSV local (se existir e cobrir o período)
+    2. GitHub raw URL (atualizado diariamente)
+    3. Yahoo Finance com retry
+    4. CoinGecko API
+    5. Binance API
     
     Args:
         start: Data inicial
         end: Data final
-        max_retries: Número máximo de tentativas por fonte
+        csv_path: Caminho do CSV local
     
     Returns:
         DataFrame com colunas ['Open', 'Close'] e índice date
@@ -126,118 +131,117 @@ def get_btc_history(start: date, end: date, max_retries: int = 3) -> pd.DataFram
     
     # Validação de datas
     if start > end:
-        print("❌ Data inicial não pode ser maior que data final")
-        return pd.DataFrame(columns=["Open", "Close"])
+        print("❌ Data inicial maior que final")
+        return _empty_btc_df()
     
-    # Ajusta end para hoje se for no futuro
     today = date.today()
     if end > today:
         end = today
         print(f"⚠️ Data final ajustada para hoje: {end}")
     
-    # MÉTODO 1: Yahoo Finance com retry
+    # PRIORIDADE 1: CSV local
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path, parse_dates=["date"], index_col="date")
+            if not df.empty:
+                # Filtra pelo período solicitado
+                df_filtered = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
+                
+                if len(df_filtered) > 0:
+                    print(f"✅ BTC carregado do CSV local ({len(df_filtered)} dias)")
+                    return df_filtered[["Open", "Close"]]
+        except Exception as e:
+            print(f"⚠️ Erro ao ler CSV local: {e}")
+    
+    # PRIORIDADE 2: GitHub raw URL
+    try:
+        csv_url = "https://raw.githubusercontent.com/Gabrielrr2025/exportbtc/refs/heads/main/btc_prices.csv"
+        df = pd.read_csv(csv_url, parse_dates=["date"], index_col="date")
+        
+        if not df.empty:
+            # Salva localmente
+            try:
+                df.to_csv(csv_path)
+                print(f"💾 CSV BTC salvo localmente")
+            except:
+                pass
+            
+            # Filtra período
+            df_filtered = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
+            
+            if len(df_filtered) > 0:
+                print(f"✅ BTC carregado do GitHub ({len(df_filtered)} dias)")
+                return df_filtered[["Open", "Close"]]
+    except Exception as e:
+        print(f"⚠️ Erro ao carregar CSV do GitHub: {e}")
+    
+    # PRIORIDADE 3+: APIs (fallback)
+    print("📡 CSV não disponível, buscando das APIs...")
+    return _fetch_btc_from_apis(start, end)
+
+def _fetch_btc_from_apis(start: date, end: date, max_retries: int = 2) -> pd.DataFrame:
+    """
+    Fallback: busca BTC de múltiplas APIs.
+    """
+    # Método 1: Yahoo Finance
     for attempt in range(max_retries):
         try:
             print(f"🔄 Tentativa {attempt + 1}/{max_retries} - Yahoo Finance...")
             
-            # Adiciona 1 dia ao end para incluir a data final
             end_adjusted = end + timedelta(days=1)
-            
-            df = yf.download(
-                "BTC-USD", 
-                start=start, 
-                end=end_adjusted, 
-                progress=False,
-                repair=True  # Tenta reparar dados quebrados
-            )
+            df = yf.download("BTC-USD", start=start, end=end_adjusted, progress=False, repair=True)
             
             if df is not None and not df.empty:
-                # Normaliza índice para date apenas (remove timezone)
                 df.index = pd.to_datetime(df.index).date
                 df.index = pd.to_datetime(df.index)
                 
-                # Valida se tem as colunas necessárias
-                required_cols = ["Open", "Close"]
-                missing_cols = [col for col in required_cols if col not in df.columns]
-                
-                if missing_cols:
-                    print(f"⚠️ Colunas faltando: {missing_cols}")
-                    raise ValueError(f"Colunas necessárias não encontradas: {missing_cols}")
-                
-                result = df[["Open", "Close"]].dropna()
-                
-                if len(result) > 0:
-                    print(f"✅ Yahoo Finance: {len(result)} dias de dados")
-                    return result
-                else:
-                    print("⚠️ Yahoo Finance retornou dados mas todos são NaN")
-                    
-            raise ValueError("Yahoo Finance retornou vazio")
-            
+                if "Open" in df.columns and "Close" in df.columns:
+                    result = df[["Open", "Close"]].dropna()
+                    if len(result) > 0:
+                        print(f"✅ Yahoo Finance: {len(result)} dias")
+                        return result
+                        
         except Exception as e:
-            print(f"⚠️ Tentativa {attempt + 1} falhou: {str(e)[:100]}")
+            print(f"⚠️ Yahoo tentativa {attempt + 1} falhou: {str(e)[:80]}")
             if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 2  # Backoff exponencial
-                print(f"⏳ Aguardando {wait_time}s antes de tentar novamente...")
-                time.sleep(wait_time)
-            else:
-                print("❌ Yahoo Finance falhou após todas as tentativas")
+                time.sleep(2)
     
-    # MÉTODO 2: CoinGecko
+    # Método 2: CoinGecko
     try:
-        print("🔄 Tentando CoinGecko API...")
+        print("🔄 Tentando CoinGecko...")
         url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
         
         start_ts = int(pd.Timestamp(start).timestamp())
         end_ts = int(pd.Timestamp(end).timestamp())
         
-        params = {
-            "vs_currency": "usd", 
-            "from": start_ts, 
-            "to": end_ts
-        }
-        
-        headers = {"User-Agent": "BTC-Backtest/1.0"}
-        
-        r = requests.get(url, params=params, headers=headers, timeout=30)
+        params = {"vs_currency": "usd", "from": start_ts, "to": end_ts}
+        r = requests.get(url, params=params, timeout=30)
         r.raise_for_status()
         
         data = r.json().get("prices", [])
-        
-        if not data:
-            raise ValueError("CoinGecko retornou lista vazia")
-        
-        # Processa dados do CoinGecko
-        rows = []
-        for ts_ms, price in data:
-            day = pd.to_datetime(ts_ms, unit="ms").date()
-            rows.append({
-                "date": pd.to_datetime(day), 
-                "Open": float(price), 
-                "Close": float(price)
-            })
-        
-        df = pd.DataFrame(rows).drop_duplicates("date").set_index("date")
-        print(f"✅ CoinGecko: {len(df)} dias de dados")
-        return df
-        
+        if data:
+            rows = []
+            for ts_ms, price in data:
+                day = pd.to_datetime(ts_ms, unit="ms").date()
+                rows.append({"date": pd.to_datetime(day), "Open": float(price), "Close": float(price)})
+            
+            df = pd.DataFrame(rows).drop_duplicates("date").set_index("date")
+            print(f"✅ CoinGecko: {len(df)} dias")
+            return df
     except Exception as e:
-        print(f"❌ CoinGecko falhou: {str(e)[:100]}")
+        print(f"❌ CoinGecko falhou: {str(e)[:80]}")
     
-    # MÉTODO 3: Binance (sem autenticação)
+    # Método 3: Binance
     try:
-        print("🔄 Tentando Binance API...")
+        print("🔄 Tentando Binance...")
+        url = "https://api.binance.com/api/v3/klines"
         
-        # Binance usa milissegundos
         start_ts = int(pd.Timestamp(start).timestamp() * 1000)
         end_ts = int(pd.Timestamp(end).timestamp() * 1000)
-        
-        url = "https://api.binance.com/api/v3/klines"
         
         all_data = []
         current_start = start_ts
         
-        # Binance limita a 1000 velas por request
         while current_start < end_ts:
             params = {
                 "symbol": "BTCUSDT",
@@ -249,73 +253,55 @@ def get_btc_history(start: date, end: date, max_retries: int = 3) -> pd.DataFram
             
             r = requests.get(url, params=params, timeout=30)
             r.raise_for_status()
-            
             batch = r.json()
+            
             if not batch:
                 break
-                
-            all_data.extend(batch)
             
-            # Atualiza para próximo batch
-            last_timestamp = batch[-1][0]
-            current_start = last_timestamp + 86400000  # +1 dia em ms
+            all_data.extend(batch)
+            current_start = batch[-1][0] + 86400000
             
             if len(batch) < 1000:
                 break
         
-        if not all_data:
-            raise ValueError("Binance retornou vazio")
-        
-        # Processa dados da Binance
-        # Formato: [timestamp, open, high, low, close, volume, ...]
-        rows = []
-        for candle in all_data:
-            day = pd.to_datetime(candle[0], unit="ms").date()
-            rows.append({
-                "date": pd.to_datetime(day),
-                "Open": float(candle[1]),
-                "Close": float(candle[4])
-            })
-        
-        df = pd.DataFrame(rows).drop_duplicates("date").set_index("date")
-        print(f"✅ Binance: {len(df)} dias de dados")
-        return df
-        
+        if all_data:
+            rows = []
+            for candle in all_data:
+                day = pd.to_datetime(candle[0], unit="ms").date()
+                rows.append({"date": pd.to_datetime(day), "Open": float(candle[1]), "Close": float(candle[4])})
+            
+            df = pd.DataFrame(rows).drop_duplicates("date").set_index("date")
+            print(f"✅ Binance: {len(df)} dias")
+            return df
     except Exception as e:
-        print(f"❌ Binance falhou: {str(e)[:100]}")
+        print(f"❌ Binance falhou: {str(e)[:80]}")
     
-    # Se tudo falhar
-    print("❌ ERRO: Todas as fontes de dados falharam!")
-    print("   Verifique sua conexão com a internet")
-    print("   Tente novamente em alguns minutos")
-    return pd.DataFrame(columns=["Open", "Close"])
+    print("❌ Todas as fontes falharam!")
+    return _empty_btc_df()
 
 def align_series(fgi: pd.DataFrame, px: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     """
     Alinha séries por data (inner join) e recorta intervalo solicitado.
     """
     if fgi is None or fgi.empty:
-        print("❌ DataFrame FGI vazio ou inválido")
+        print("❌ DataFrame FGI vazio")
         return pd.DataFrame(columns=["Open", "Close", "FGI"])
     
     if px is None or px.empty:
-        print("❌ DataFrame de preços vazio ou inválido")
+        print("❌ DataFrame BTC vazio")
         return pd.DataFrame(columns=["Open", "Close", "FGI"])
     
     print(f"🔗 Alinhando séries...")
-    print(f"   FGI: {len(fgi)} dias ({fgi.index.min()} - {fgi.index.max()})")
-    print(f"   BTC: {len(px)} dias ({px.index.min()} - {px.index.max()})")
+    print(f"   FGI: {len(fgi)} dias ({fgi.index.min().date()} - {fgi.index.max().date()})")
+    print(f"   BTC: {len(px)} dias ({px.index.min().date()} - {px.index.max().date()})")
     
     df = px.join(fgi, how="inner")
-    
     print(f"   Após join: {len(df)} dias")
     
-    # Filtra por data
     df = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
-    
-    print(f"   Após filtro de datas: {len(df)} dias")
+    print(f"   Após filtro: {len(df)} dias")
     
     if df.empty:
-        print("⚠️ Nenhum dado após alinhamento. Verifique se os períodos se sobrepõem.")
+        print("⚠️ Vazio após alinhamento. Verifique sobreposição de datas.")
     
     return df
