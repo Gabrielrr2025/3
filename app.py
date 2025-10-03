@@ -1,90 +1,64 @@
-import pandas as pd
-import requests
-import yfinance as yf
-from datetime import datetime, date
+from flask import Flask, request, jsonify, render_template
+from data import get_fgi_history, get_btc_history, align_series  # corrigido: não importa de app, mas de data
+from backtest import run_backtest, summary_metrics, equity_curves
 
-def _empty_fgi_df():
-    # DataFrame vazio com índice datetime nomeado "date" e coluna FGI float
-    return pd.DataFrame({"FGI": pd.Series(dtype="float")}).set_index(
-        pd.DatetimeIndex([], name="date")
-    )
+app = Flask(__name__)
 
-def get_fgi_history() -> pd.DataFrame:
-    """
-    Baixa histórico do Fear & Greed Index (FGI) em formato JSON.
-    Retorna DF com índice 'date' (datetime) e coluna 'FGI' (float).
-    Em caso de falha/sem dados, retorna DF vazio (não quebra o app).
-    """
-    url = "https://api.alternative.me/fng/"
-    params = {"limit": 0, "format": "json", "date_format": "us"}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; FGI-Backtest/1.0; +https://example.com)"
-    }
+@app.route("/")
+def index():
+    # Healthcheck simples
+    return jsonify({"status": "ok", "message": "Fear & Greed Backtest API rodando"})
 
+@app.route("/api/backtest", methods=["POST"])
+def api_backtest():
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
-        data = payload.get("data", [])
-        if not data:
-            # Sem dados retornados
-            return _empty_fgi_df()
+        data = request.get_json(force=True)
 
-        rows = []
-        for d in data:
-            # Esperado: d["timestamp"] e d["value"]
-            ts = d.get("timestamp")
-            val = d.get("value")
-            if ts is None or val is None:
-                continue
-            try:
-                ts_int = int(ts)
-                day = datetime.utcfromtimestamp(ts_int).date()
-                rows.append({"date": pd.to_datetime(day), "FGI": float(val)})
-            except Exception:
-                # Pula entradas inesperadas
-                continue
+        start_date = data.get("start_date")
+        end_date = data.get("end_date")
+        buy_threshold = int(data.get("buy_threshold", 30))
+        sell_threshold = int(data.get("sell_threshold", 70))
+        initial_capital = float(data.get("initial_capital", 10000.0))
 
-        if not rows:
-            return _empty_fgi_df()
+        # Validações básicas
+        if not start_date or not end_date:
+            return jsonify({"erro": "start_date e end_date são obrigatórios"}), 400
+        if sell_threshold <= buy_threshold:
+            return jsonify({"erro": "sell_threshold deve ser maior que buy_threshold"}), 400
 
-        fgi = (
-            pd.DataFrame(rows)
-            .drop_duplicates(subset=["date"])
-            .sort_values("date")
-            .set_index("date")
+        fgi = get_fgi_history()
+        btc = get_btc_history(start_date, end_date)
+        df = align_series(fgi, btc, start_date, end_date)
+
+        if df.empty:
+            return jsonify({"erro": "Sem dados disponíveis no período informado"}), 404
+
+        trades, portfolio = run_backtest(
+            df=df,
+            buy_th=buy_threshold,
+            sell_th=sell_threshold,
+            initial_capital=initial_capital,
+            trade_on_close=True,
+            reinvest=True,
+            fee_bps=10
         )
-        # Garante tipo float
-        fgi["FGI"] = fgi["FGI"].astype(float)
-        return fgi
 
-    except Exception:
-        # Em qualquer erro de rede/JSON, retorna vazio
-        return _empty_fgi_df()
+        metrics = summary_metrics(portfolio, df["Close"], initial_capital)
+        metrics["n_trades"] = len(trades)
 
-def get_btc_history(start: date, end: date) -> pd.DataFrame:
-    """
-    Preço diário do BTC-USD via Yahoo Finance (yfinance).
-    Retorna colunas Open/Close e índice por dia (datetime).
-    """
-    ticker = yf.Ticker("BTC-USD")
-    df = ticker.history(start=start, end=end)
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Open", "Close"])
+        return jsonify({
+            "metrics": metrics,
+            "trades": trades.to_dict(orient="records"),
+            "portfolio": portfolio.reset_index().to_dict(orient="records")
+        })
 
-    df = df.rename(columns={"Open": "Open", "Close": "Close"})
-    # Usa somente a data (diário)
-    df.index = pd.to_datetime(df.index.date)
-    return df[["Open", "Close"]].dropna()
+    except Exception as e:
+        return jsonify({"erro": str(e)}), 500
 
-def align_series(fgi: pd.DataFrame, px: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    """
-    Alinha séries por data (inner join) e recorta intervalo solicitado.
-    Se alguma vier vazia, o resultado tende a ser vazio (tratado no app).
-    """
-    if fgi is None or fgi.empty or px is None or px.empty:
-        return pd.DataFrame(columns=["Open", "Close", "FGI"])
+@app.route("/api/optimize", methods=["POST"])
+def api_optimize():
+    # endpoint futuro para rodar testes de sensibilidade
+    return jsonify({"status": "em construção"})
 
-    df = px.join(fgi, how="inner")
-    df = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
-    return df
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
