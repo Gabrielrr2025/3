@@ -1,15 +1,12 @@
-# Web
+--only-binary=:all:
+--upgrade-strategy=eager
+
 Flask==3.0.3
 Flask-Cors==4.0.0
-
-# Prod server
 gunicorn==22.0.0
 
-# Data
-numpy==1.26.4         # < 2.0, tem wheel pra 3.11
+numpy==1.26.4
 pandas==2.2.2
 requests==2.32.3
 yfinance==0.2.40
-
-# Excel
 openpyxl==3.1.2
