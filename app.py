@@ -1,64 +1,83 @@
-from flask import Flask, request, jsonify, render_template
-from data import get_fgi_history, get_btc_history, align_series  # corrigido: não importa de app, mas de data
+#!/usr/bin/env python3
+import io
+from datetime import date
+import pandas as pd
+import streamlit as st
+
 from backtest import run_backtest, summary_metrics, equity_curves
+from data import get_fgi_history, get_btc_history, align_series
 
-app = Flask(__name__)
+st.set_page_config(page_title="BTC Fear & Greed Backtest", layout="wide")
+st.title("📈 Backtest BTC usando Fear & Greed Index")
+st.caption("Compra quando FGI < limiar de 'medo' e vende quando FGI > limiar de 'ganância'. Dados diários.")
 
-@app.route("/")
-def index():
-    # Healthcheck simples
-    return jsonify({"status": "ok", "message": "Fear & Greed Backtest API rodando"})
+with st.sidebar:
+    st.header("Parâmetros")
+    start = st.date_input("Data inicial", value=date(2018, 2, 1), help="FGI tem histórico desde 2018.")
+    end = st.date_input("Data final", value=date.today())
+    buy_th = st.number_input("Comprar quando FGI < ", value=30, min_value=0, max_value=49, step=1)
+    sell_th = st.number_input("Vender quando FGI > ", value=70, min_value=51, max_value=100, step=1)
+    initial_capital = st.number_input("Capital inicial (USD)", value=10000.0, min_value=10.0, step=100.0, format="%.2f")
+    trade_on_close = st.selectbox("Preço da execução", ["Fechamento (close)", "Abertura do dia seguinte (open)"]) == "Fechamento (close)"
+    fee_bps = st.number_input("Taxa por trade (bps)", value=10, min_value=0, max_value=2000, help="1 bps = 0,01%.")
 
-@app.route("/api/backtest", methods=["POST"])
-def api_backtest():
-    try:
-        data = request.get_json(force=True)
+st.info("Buscando dados do Fear & Greed Index e do preço do BTC...")
+try:
+    fgi = get_fgi_history()
+    px = get_btc_history(start, end)
+    df = align_series(fgi, px, start, end)
+except Exception as e:
+    st.error(f"Falha ao obter dados: {e}")
+    st.stop()
 
-        start_date = data.get("start_date")
-        end_date = data.get("end_date")
-        buy_threshold = int(data.get("buy_threshold", 30))
-        sell_threshold = int(data.get("sell_threshold", 70))
-        initial_capital = float(data.get("initial_capital", 10000.0))
+if df is None or df.empty:
+    st.error("Sem dados no período (ou a fonte não retornou valores).")
+    st.caption(f"Debug — FGI linhas: {0 if fgi is None else len(fgi)} | BTC linhas: {0 if px is None else len(px)}")
+    st.stop()
 
-        # Validações básicas
-        if not start_date or not end_date:
-            return jsonify({"erro": "start_date e end_date são obrigatórios"}), 400
-        if sell_threshold <= buy_threshold:
-            return jsonify({"erro": "sell_threshold deve ser maior que buy_threshold"}), 400
+st.subheader("Amostra de dados")
+st.dataframe(df.head(10))
 
-        fgi = get_fgi_history()
-        btc = get_btc_history(start_date, end_date)
-        df = align_series(fgi, btc, start_date, end_date)
+st.subheader("Regras da estratégia")
+st.write(f"• **Compra** FGI < **{buy_th}** • **Venda** FGI > **{sell_th}** • Execução: {'close' if trade_on_close else 'next open'} • Taxa: {fee_bps} bps")
 
-        if df.empty:
-            return jsonify({"erro": "Sem dados disponíveis no período informado"}), 404
+trades, portfolio = run_backtest(
+    df=df,
+    buy_th=buy_th,
+    sell_th=sell_th,
+    initial_capital=initial_capital,
+    trade_on_close=trade_on_close,
+    reinvest=True,
+    fee_bps=fee_bps
+)
 
-        trades, portfolio = run_backtest(
-            df=df,
-            buy_th=buy_threshold,
-            sell_th=sell_threshold,
-            initial_capital=initial_capital,
-            trade_on_close=True,
-            reinvest=True,
-            fee_bps=10
-        )
+metrics = summary_metrics(portfolio, df["Close"], initial_capital)
+metrics["n_trades"] = len(trades)
 
-        metrics = summary_metrics(portfolio, df["Close"], initial_capital)
-        metrics["n_trades"] = len(trades)
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Retorno Estratégia", f"{metrics['strategy_return']*100:,.2f}%", f"{metrics['strategy_cagr']*100:,.2f}% a.a.")
+c2.metric("Retorno Buy&Hold", f"{metrics['bh_return']*100:,.2f}%", f"{metrics['bh_cagr']*100:,.2f}% a.a.")
+c3.metric("Máx. Drawdown (Estrat.)", f"{metrics['strategy_mdd']*100:,.2f}%")
+c4.metric("Nº de operações", int(metrics["n_trades"]))
 
-        return jsonify({
-            "metrics": metrics,
-            "trades": trades.to_dict(orient="records"),
-            "portfolio": portfolio.reset_index().to_dict(orient="records")
-        })
+st.subheader("Curva de capital")
+curves = equity_curves(portfolio, df["Close"], initial_capital)
+st.line_chart(curves)
 
-    except Exception as e:
-        return jsonify({"erro": str(e)}), 500
+with st.expander("Operações (trades)"):
+    st.dataframe(trades)
 
-@app.route("/api/optimize", methods=["POST"])
-def api_optimize():
-    # endpoint futuro para rodar testes de sensibilidade
-    return jsonify({"status": "em construção"})
+st.subheader("Exportar resultados")
+def to_excel_bytes(trades_df, portfolio_df, curves_df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as w:
+        trades_df.to_excel(w, sheet_name="trades", index=False)
+        portfolio_df.to_excel(w, sheet_name="portfolio", index=True)
+        curves_df.to_excel(w, sheet_name="equity_curves", index=True)
+    return output.getvalue()
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+excel_bytes = to_excel_bytes(trades, portfolio, curves)
+st.download_button("Baixar Excel", data=excel_bytes, file_name="fgi_backtest.xlsx")
+st.download_button("Baixar Trades (CSV)", data=trades.to_csv(index=False).encode("utf-8"), file_name="trades.csv")
+
+st.caption("Aviso: backtests não garantem resultados futuros. Uso educacional.")
