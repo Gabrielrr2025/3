@@ -1,7 +1,7 @@
 import pandas as pd
 import requests
 import yfinance as yf
-from datetime import datetime, date
+from datetime import date
 
 def _empty_fgi_df():
     return pd.DataFrame({"FGI": pd.Series(dtype="float")}).set_index(
@@ -10,65 +10,32 @@ def _empty_fgi_df():
 
 def get_fgi_history() -> pd.DataFrame:
     """
-    Baixa histórico do Fear & Greed Index (FGI) em formato JSON.
-    Fonte oficial: https://api.alternative.me/fng/
-    Retorna DF com índice 'date' (datetime) e coluna 'FGI' (float).
+    Carrega o Fear & Greed Index diretamente do CSV no GitHub.
+    O CSV é atualizado automaticamente via GitHub Actions.
     """
-    url = "https://api.alternative.me/fng/"
-    params = {"limit": 0, "format": "json", "date_format": "us"}
-    headers = {"User-Agent": "FGI-Backtest/1.0"}
-
     try:
-        r = requests.get(url, params=params, headers=headers, timeout=30)
-        r.raise_for_status()
-        payload = r.json()
-        data = payload.get("data", [])
-        if not data:
-            return _empty_fgi_df()
-
-        rows = []
-        for d in data:
-            ts = d.get("timestamp")
-            val = d.get("value")
-            if ts is None or val is None:
-                continue
-            try:
-                ts_int = int(ts)
-                day = datetime.utcfromtimestamp(ts_int).date()
-                rows.append({"date": pd.to_datetime(day), "FGI": float(val)})
-            except Exception:
-                continue
-
-        if not rows:
-            return _empty_fgi_df()
-
-        fgi = (
-            pd.DataFrame(rows)
-            .drop_duplicates(subset=["date"])
-            .sort_values("date")
-            .set_index("date")
-        )
+        csv_url = "https://raw.githubusercontent.com/Gabrielrr2025/csv/refs/heads/main/fear_greed.csv"
+        fgi = pd.read_csv(csv_url, parse_dates=["date"], index_col="date")
         fgi["FGI"] = fgi["FGI"].astype(float)
+        print(f"✅ FGI carregado do GitHub ({len(fgi)} linhas)")
         return fgi
-
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Erro ao carregar CSV do GitHub: {e}")
         return _empty_fgi_df()
 
 def get_btc_history(start: date, end: date) -> pd.DataFrame:
     """
     Preço diário do BTC-USD.
-    1) Tenta via Yahoo Finance (yfinance)
+    1) Tenta via Yahoo Finance
     2) Se falhar, usa CoinGecko como fallback
     """
     try:
-        # Yahoo Finance mais estável com yf.download
         df = yf.download("BTC-USD", start=start, end=end, progress=False)
         if df is not None and not df.empty:
             df.index = pd.to_datetime(df.index.date)
             return df[["Open", "Close"]].dropna()
         raise ValueError("Yahoo retornou vazio")
     except Exception:
-        # Fallback CoinGecko (Close = preço único do dia)
         try:
             url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
             start_ts = int(pd.Timestamp(start).timestamp())
