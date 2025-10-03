@@ -2,47 +2,25 @@ import pandas as pd
 import requests
 import yfinance as yf
 from datetime import datetime, date
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# ===== Helpers =====
-def _requests_session():
-    session = requests.Session()
-    retry = Retry(
-        total=3,
-        backoff_factor=0.8,  # 0.8s, 1.6s, 3.2s
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=("GET",),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; FGI-Backtest/1.0; +https://example.com)"
-    })
-    return session
 
 def _empty_fgi_df():
     return pd.DataFrame({"FGI": pd.Series(dtype="float")}).set_index(
         pd.DatetimeIndex([], name="date")
     )
 
-# ===== Funções principais =====
 def get_fgi_history() -> pd.DataFrame:
     """
-    Baixa histórico do Fear & Greed Index (FGI).
-    Retorna DF com índice 'date' e coluna 'FGI' (float entre 0..100).
+    Baixa histórico do Fear & Greed Index (FGI) em formato JSON.
+    Fonte oficial: https://api.alternative.me/fng/
+    Retorna DF com índice 'date' (datetime) e coluna 'FGI' (float).
     """
     url = "https://api.alternative.me/fng/"
     params = {"limit": 0, "format": "json", "date_format": "us"}
+    headers = {"User-Agent": "FGI-Backtest/1.0"}
 
     try:
-        s = _requests_session()
-        r = s.get(url, params=params, timeout=30)
-        if r.status_code >= 400:
-            return _empty_fgi_df()
-
+        r = requests.get(url, params=params, headers=headers, timeout=30)
+        r.raise_for_status()
         payload = r.json()
         data = payload.get("data", [])
         if not data:
@@ -70,8 +48,7 @@ def get_fgi_history() -> pd.DataFrame:
             .sort_values("date")
             .set_index("date")
         )
-        fgi["FGI"] = pd.to_numeric(fgi["FGI"], errors="coerce").clip(0, 100)
-        fgi.index = pd.DatetimeIndex(fgi.index, name="date")
+        fgi["FGI"] = fgi["FGI"].astype(float)
         return fgi
 
     except Exception:
@@ -79,41 +56,44 @@ def get_fgi_history() -> pd.DataFrame:
 
 def get_btc_history(start: date, end: date) -> pd.DataFrame:
     """
-    Preço diário do BTC-USD via Yahoo Finance (yfinance).
-    Retorna colunas Open/Close e índice diário.
+    Preço diário do BTC-USD.
+    1) Tenta via Yahoo Finance (yfinance)
+    2) Se falhar, usa CoinGecko como fallback
     """
-    if start is None or end is None:
-        return pd.DataFrame(columns=["Open", "Close"])
-
-    df = yf.Ticker("BTC-USD").history(start=start, end=end, interval="1d")
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Open", "Close"])
-
-    df = df.rename(columns={"Open": "Open", "Close": "Close"})
-    df.index = pd.to_datetime(df.index.date)
-    df.index.name = "date"
-    out = df[["Open", "Close"]].dropna()
-    out["Open"] = pd.to_numeric(out["Open"], errors="coerce")
-    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
-    return out.dropna()
+    try:
+        # Yahoo Finance mais estável com yf.download
+        df = yf.download("BTC-USD", start=start, end=end, progress=False)
+        if df is not None and not df.empty:
+            df.index = pd.to_datetime(df.index.date)
+            return df[["Open", "Close"]].dropna()
+        raise ValueError("Yahoo retornou vazio")
+    except Exception:
+        # Fallback CoinGecko (Close = preço único do dia)
+        try:
+            url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart/range"
+            start_ts = int(pd.Timestamp(start).timestamp())
+            end_ts = int(pd.Timestamp(end).timestamp())
+            params = {"vs_currency": "usd", "from": start_ts, "to": end_ts}
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            data = r.json().get("prices", [])
+            if not data:
+                return pd.DataFrame(columns=["Open", "Close"])
+            rows = []
+            for ts, price in data:
+                day = pd.to_datetime(ts, unit="ms").date()
+                rows.append({"date": day, "Open": float(price), "Close": float(price)})
+            df = pd.DataFrame(rows).drop_duplicates("date").set_index("date")
+            return df
+        except Exception:
+            return pd.DataFrame(columns=["Open", "Close"])
 
 def align_series(fgi: pd.DataFrame, px: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     """
-    Alinha por data:
-      - usa calendário do preço (px) como base
-      - FGI é forward-filled
-      - recorta pelo intervalo
+    Alinha séries por data (inner join) e recorta intervalo solicitado.
     """
     if fgi is None or fgi.empty or px is None or px.empty:
         return pd.DataFrame(columns=["Open", "Close", "FGI"])
-
-    start_dt = pd.to_datetime(start)
-    end_dt = pd.to_datetime(end)
-
-    fgi_re = fgi.reindex(px.index).ffill()
-    df = px.join(fgi_re, how="left")
-    df = df.loc[(df.index >= start_dt) & (df.index <= end_dt)]
-    df = df.dropna(subset=["Open", "Close"])
-    df["FGI"] = pd.to_numeric(df["FGI"], errors="coerce").clip(0, 100).ffill()
-
-    return df[["Open", "Close", "FGI"]]
+    df = px.join(fgi, how="inner")
+    df = df.loc[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
+    return df
