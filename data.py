@@ -1,84 +1,119 @@
-from flask import Flask, render_template, request, jsonify
-from datetime import date, timedelta
-from app import get_fgi_history, get_btc_history, align_series
-from backtest import run_fgi_strategy, analyze_threshold_sensitivity
-import os
+import pandas as pd
+import requests
+import yfinance as yf
+from datetime import datetime, date
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-app = Flask(__name__)
+# ===== Helpers =====
+def _requests_session():
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.8,  # 0.8s, 1.6s, 3.2s
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; FGI-Backtest/1.0; +https://example.com)"
+    })
+    return session
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+def _empty_fgi_df():
+    return pd.DataFrame({"FGI": pd.Series(dtype="float")}).set_index(
+        pd.DatetimeIndex([], name="date")
+    )
 
-@app.route('/api/backtest', methods=['POST'])
-def backtest():
+# ===== Funções principais =====
+def get_fgi_history() -> pd.DataFrame:
+    """
+    Baixa histórico do Fear & Greed Index (FGI).
+    Retorna DF com índice 'date' e coluna 'FGI' (float entre 0..100).
+    """
+    url = "https://api.alternative.me/fng/"
+    params = {"limit": 0, "format": "json", "date_format": "us"}
+
     try:
-        # Parâmetros da requisição
-        data = request.get_json()
-        buy_threshold = int(data.get('buy_threshold', 30))
-        sell_threshold = int(data.get('sell_threshold', 70))
-        
-        # Define período (últimos 2 anos por padrão)
-        end_date = data.get('end_date')
-        start_date = data.get('start_date')
-        
-        if end_date:
-            end_date = date.fromisoformat(end_date)
-        else:
-            end_date = date.today()
-        
-        if start_date:
-            start_date = date.fromisoformat(start_date)
-        else:
-            start_date = end_date - timedelta(days=730)  # 2 anos
-        
-        # Baixa dados
-        fgi_df = get_fgi_history()
-        btc_df = get_btc_history(start_date, end_date)
-        
-        # Alinha séries
-        df = align_series(fgi_df, btc_df, start_date, end_date)
-        
-        if df.empty:
-            return jsonify({
-                'erro': 'Não há dados suficientes para o período selecionado'
-            }), 400
-        
-        # Executa backtest
-        results = run_fgi_strategy(df, buy_threshold, sell_threshold)
-        
-        return jsonify(results)
-    
-    except Exception as e:
-        return jsonify({'erro': str(e)}), 500
+        s = _requests_session()
+        r = s.get(url, params=params, timeout=30)
+        if r.status_code >= 400:
+            return _empty_fgi_df()
 
-@app.route('/api/optimize', methods=['POST'])
-def optimize():
-    try:
-        # Define período
-        end_date = date.today()
-        start_date = end_date - timedelta(days=730)
-        
-        # Baixa dados
-        fgi_df = get_fgi_history()
-        btc_df = get_btc_history(start_date, end_date)
-        df = align_series(fgi_df, btc_df, start_date, end_date)
-        
-        if df.empty:
-            return jsonify({
-                'erro': 'Não há dados suficientes'
-            }), 400
-        
-        # Analisa diferentes thresholds
-        sensitivity = analyze_threshold_sensitivity(df)
-        
-        return jsonify({
-            'melhores_parametros': sensitivity.head(10).to_dict('records')
-        })
-    
-    except Exception as e:
-        return jsonify({'erro': str(e)}), 500
+        payload = r.json()
+        data = payload.get("data", [])
+        if not data:
+            return _empty_fgi_df()
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+        rows = []
+        for d in data:
+            ts = d.get("timestamp")
+            val = d.get("value")
+            if ts is None or val is None:
+                continue
+            try:
+                ts_int = int(ts)
+                day = datetime.utcfromtimestamp(ts_int).date()
+                rows.append({"date": pd.to_datetime(day), "FGI": float(val)})
+            except Exception:
+                continue
+
+        if not rows:
+            return _empty_fgi_df()
+
+        fgi = (
+            pd.DataFrame(rows)
+            .drop_duplicates(subset=["date"])
+            .sort_values("date")
+            .set_index("date")
+        )
+        fgi["FGI"] = pd.to_numeric(fgi["FGI"], errors="coerce").clip(0, 100)
+        fgi.index = pd.DatetimeIndex(fgi.index, name="date")
+        return fgi
+
+    except Exception:
+        return _empty_fgi_df()
+
+def get_btc_history(start: date, end: date) -> pd.DataFrame:
+    """
+    Preço diário do BTC-USD via Yahoo Finance (yfinance).
+    Retorna colunas Open/Close e índice diário.
+    """
+    if start is None or end is None:
+        return pd.DataFrame(columns=["Open", "Close"])
+
+    df = yf.Ticker("BTC-USD").history(start=start, end=end, interval="1d")
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Open", "Close"])
+
+    df = df.rename(columns={"Open": "Open", "Close": "Close"})
+    df.index = pd.to_datetime(df.index.date)
+    df.index.name = "date"
+    out = df[["Open", "Close"]].dropna()
+    out["Open"] = pd.to_numeric(out["Open"], errors="coerce")
+    out["Close"] = pd.to_numeric(out["Close"], errors="coerce")
+    return out.dropna()
+
+def align_series(fgi: pd.DataFrame, px: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """
+    Alinha por data:
+      - usa calendário do preço (px) como base
+      - FGI é forward-filled
+      - recorta pelo intervalo
+    """
+    if fgi is None or fgi.empty or px is None or px.empty:
+        return pd.DataFrame(columns=["Open", "Close", "FGI"])
+
+    start_dt = pd.to_datetime(start)
+    end_dt = pd.to_datetime(end)
+
+    fgi_re = fgi.reindex(px.index).ffill()
+    df = px.join(fgi_re, how="left")
+    df = df.loc[(df.index >= start_dt) & (df.index <= end_dt)]
+    df = df.dropna(subset=["Open", "Close"])
+    df["FGI"] = pd.to_numeric(df["FGI"], errors="coerce").clip(0, 100).ffill()
+
+    return df[["Open", "Close", "FGI"]]
