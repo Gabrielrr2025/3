@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import io
-from datetime import date
+from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
@@ -15,7 +15,7 @@ st.caption("Compra quando FGI < limiar de 'medo' e vende quando FGI > limiar de 
 with st.sidebar:
     st.header("Parâmetros")
     start = st.date_input("Data inicial", value=date(2018, 2, 1), help="FGI tem histórico desde 2018.")
-    end = st.date_input("Data final", value=date.today())
+    end = st.date_input("Data final", value=date.today() - timedelta(days=1))
     buy_th = st.number_input("Comprar quando FGI < ", value=30, min_value=0, max_value=49, step=1)
     sell_th = st.number_input("Vender quando FGI > ", value=70, min_value=51, max_value=100, step=1)
     initial_capital = st.number_input("Capital inicial (USD)", value=10000.0, min_value=10.0, step=100.0, format="%.2f")
@@ -91,3 +91,5 @@ if st.button("▶️ Rodar backtest"):
 
     st.caption("Aviso: backtests não garantem resultados futuros. Uso educacional.")
 
+# ===== Fonte =====
+st.caption("Fonte do Fear & Greed Index: alternative.me")
